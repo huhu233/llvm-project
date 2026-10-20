@@ -42,6 +42,37 @@ using namespace llvm;
 
 #define AARCH64_EXPAND_PSEUDO_NAME "AArch64 pseudo instruction expansion pass"
 
+static cl::opt<bool> TransformMovToMovprfx(
+    "aarch64-sve-transform-mov-to-movprfx", cl::init(true), cl::Hidden,
+    cl::desc("Enable the transform from mov to movprfx when the use of mov is "
+             "destructive instruction."));
+
+static cl::opt<unsigned>
+    TraversalInstThreshold("aarch64-traversal-inst-threshold", cl::Hidden,
+                           cl::init(26),
+                           cl::desc("The maximum number of instructions "
+                                    "traversed after the move instruction"));
+static cl::opt<bool>
+    GenMovprfxOrMovForUnary("aarch64-movprfx-or-mov-for-unary", cl::Hidden,
+                            cl::init(true),
+                            cl::desc("Generate movprfx or mov for unary inst"));
+
+static cl::opt<bool> GenMovForLongLatencyInst(
+    "aarch64-mov-for-long-latency-inst", cl::Hidden, cl::init(true),
+    cl::desc("Generate mov for long latency instructions like fsqrt."));
+
+// List of SVE destructive instructions that are considered to have a long
+// latency on the target microarchitectures. For these instructions we prefer
+// to emit a plain MOV (ORR_ZZZ) rather than a MOVPRFX so that the destructive
+// instruction can be scheduled independently from the prefix move.
+// The array MUST be kept sorted in ascending opcode order because
+// isInSpecificInstOpcList performs a binary search via llvm::lower_bound.
+static const unsigned LongLatencyInstOpcode[] = {
+    AArch64::FSQRT_ZPmZ_D,
+    AArch64::FSQRT_ZPmZ_H,
+    AArch64::FSQRT_ZPmZ_S,
+};
+
 namespace {
 
 class AArch64ExpandPseudoImpl {
@@ -54,6 +85,15 @@ private:
   bool expandMBB(MachineBasicBlock &MBB);
   bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                 MachineBasicBlock::iterator &NextMBBI);
+  bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+                MachineBasicBlock::iterator &NextMBBI,
+                SmallPtrSet<MachineInstr *, 16> &RemoveMIs);
+  bool optimizeMI(MachineInstr &MI, MachineInstr &DefUseMI,
+                  MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+                  MachineBasicBlock::iterator DefUseMBBI,
+                  SmallPtrSet<MachineInstr *, 16> &RemoveMIs, bool IsMoveOrr);
+  bool isInSpecificInstOpcList(const ArrayRef<unsigned> &SpecificInstOpcList,
+                               unsigned UseOpcode);
   bool expandMultiVecPseudo(MachineBasicBlock &MBB,
                             MachineBasicBlock::iterator MBBI,
                             const TargetRegisterClass &ContiguousClass,
@@ -554,6 +594,15 @@ bool AArch64ExpandPseudoImpl::expand_DestructiveOp(
   // is the destructive operand, not as any other operand,
   // so the Destructive Operand must be unique.
   bool DOPRegIsUnique = false;
+  // Whether to emit a movprfx (or mov) before the destructive instruction.
+  // For DestructiveUnaryPassthru this is controlled by the
+  // -aarch64-movprfx-or-mov-for-unary flag.
+  bool ShouldGenMovprfxOrMov = true;
+  // Long-latency instructions (e.g. fsqrt) benefit from a plain MOV (which
+  // can be scheduled independently) instead of a MOVPRFX (which is bundled
+  // with the destructive instruction and forces a dependency).
+  bool IsLongLatencyInst =
+      isInSpecificInstOpcList(LongLatencyInstOpcode, Opcode);
   switch (DType) {
   case AArch64::DestructiveBinary:
     DOPRegIsUnique = DstReg != MI.getOperand(SrcIdx).getReg();
@@ -565,6 +614,8 @@ bool AArch64ExpandPseudoImpl::expand_DestructiveOp(
       MI.getOperand(DOPIdx).getReg() != MI.getOperand(SrcIdx).getReg();
     break;
   case AArch64::DestructiveUnaryPassthru:
+    ShouldGenMovprfxOrMov = GenMovprfxOrMovForUnary;
+    [[fallthrough]];
   case AArch64::DestructiveBinaryImm:
   case AArch64::DestructiveBinaryImmUnpred:
   case AArch64::DestructiveBinaryShImmUnpred:
@@ -659,7 +710,20 @@ bool AArch64ExpandPseudoImpl::expand_DestructiveOp(
           .addReg(DstReg)
           .addImm(0);
     }
-  } else if (DstReg != MI.getOperand(DOPIdx).getReg()) {
+  } else if (ShouldGenMovprfxOrMov && GenMovForLongLatencyInst &&
+             IsLongLatencyInst && DstReg != MI.getOperand(DOPIdx).getReg()) {
+    // For long-latency instructions, emit a plain MOV (ORR_ZZZ) instead of a
+    // MOVPRFX. The MOV is intentionally NOT bundled with the destructive
+    // instruction (the PRFX.getInstr()->getOpcode() != ORR_ZZZ check below
+    // skips the finalizeBundle/transferImpOps step) so that the scheduler is
+    // free to move the destructive instruction independently of the move.
+    PRFX = BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(AArch64::ORR_ZZZ))
+               .addReg(DstReg, RegState::Define)
+               .addReg(MI.getOperand(DOPIdx).getReg())
+               .addReg(MI.getOperand(DOPIdx).getReg());
+    DOPIdx = 0;
+  } else if (DstReg != MI.getOperand(DOPIdx).getReg() &&
+             ShouldGenMovprfxOrMov) {
     assert(DOPRegIsUnique && "The destructive operand should be unique");
     PRFX = BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(MovPrfx))
                .addReg(DstReg, RegState::Define)
@@ -707,7 +771,10 @@ bool AArch64ExpandPseudoImpl::expand_DestructiveOp(
     break;
   }
 
-  if (PRFX) {
+  // Bundle the MOVPRFX with the destructive instruction so that the
+  // scheduler treats them as a unit. The long-latency MOV (ORR_ZZZ) path
+  // above is deliberately excluded from the bundle to keep it schedulable.
+  if (PRFX && PRFX.getInstr()->getOpcode() != AArch64::ORR_ZZZ) {
     transferImpOps(MI, PRFX, DOP);
     finalizeBundle(MBB, PRFX->getIterator(), MBBI->getIterator());
   } else
@@ -2015,18 +2082,1017 @@ bool AArch64ExpandPseudoImpl::expandMI(MachineBasicBlock &MBB,
   return false;
 }
 
+/// This function transforms "mov + destructive instruction" to
+/// "movprfx + destructive instruction". That is, delete the "mov" instruction
+/// and insert "movprfx" just at the front of the destructive instruction.
+/// Eg:
+/// Transform:
+///   mov z0.d, z3.d
+///   ...
+///   other inst (no use z3/z0 and no def z3/z0)
+///   ...
+///   fmul z0.d, p0/m, z0.d, z3.d
+/// To:
+///   ...
+///   other inst (no use z3/z0 and no def z3/z0)
+///   ...
+///   movprfx z0, z3
+///   fmul z0.d, p0/m, z0.d, z3.d
+///   ...
+///   other inst (no use z3/z0 and no def z3/z0)
+///   ...
+///
+/// \param MI       The ORR_ZZZ mov instruction that is being removed.
+/// \param DefUseMI The destructive instruction that consumes CopyDstReg.
+/// \param MBB      The basic block containing both instructions.
+/// \param MovMBBI  Iterator pointing at the mov instruction (MI).
+/// \param DefUseMBBI Iterator pointing at the destructive instruction.
+/// \param RemoveMIs Set into which DefUseMI is inserted for deferred erasure.
+/// \param IsMoveOrr If true, the mov's source register is unchanged between
+///                  the mov and DefUseMI, so the movprfx can be emitted
+///                  immediately before DefUseMI; otherwise it is emitted at
+///                  the original mov position.
+bool AArch64ExpandPseudoImpl::optimizeMI(
+    MachineInstr &MI, MachineInstr &DefUseMI, MachineBasicBlock &MBB,
+    MachineBasicBlock::iterator MovMBBI, MachineBasicBlock::iterator DefUseMBBI,
+    SmallPtrSet<MachineInstr *, 16> &RemoveMIs, bool IsMoveOrr) {
+  MCPhysReg CopyDstReg = MI.getOperand(0).getReg();
+  MCPhysReg CopySrcReg = MI.getOperand(1).getReg();
+  unsigned Opcode = DefUseMI.getOpcode();
+  uint64_t DType = TII->get(Opcode).TSFlags & AArch64::DestructiveInstTypeMask;
+  Register DefUseDstReg = DefUseMI.getOperand(0).getReg();
+  bool DstIsDead = DefUseMI.getOperand(0).isDead();
+  bool UseRev = false;
+  // Operand indices for the destructive instruction. Initialised to 0 so that
+  // any path that fails to assign one of the indices used later is caught by
+  // an out-of-bounds access in debug builds rather than reading garbage.
+  unsigned PredIdx = 0, DOPIdx = 0, SrcIdx = 0, Src2Idx = 0, Src3Idx = 0;
+  switch (DType) {
+  case AArch64::DestructiveBinaryComm:
+  case AArch64::DestructiveBinaryCommWithRev:
+    if (DefUseDstReg == DefUseMI.getOperand(3).getReg()) {
+      std::tie(PredIdx, DOPIdx, SrcIdx) = std::make_tuple(1, 3, 2);
+      UseRev = true;
+      break;
+    }
+    [[fallthrough]];
+  case AArch64::DestructiveBinary:
+  case AArch64::DestructiveBinaryImm:
+    std::tie(PredIdx, DOPIdx, SrcIdx) = std::make_tuple(1, 2, 3);
+    break;
+  case AArch64::DestructiveUnaryPassthru:
+    std::tie(PredIdx, DOPIdx, SrcIdx) = std::make_tuple(2, 1, 3);
+    break;
+  case AArch64::DestructiveTernaryCommWithRev:
+    std::tie(PredIdx, DOPIdx, SrcIdx, Src2Idx) = std::make_tuple(1, 2, 3, 4);
+    if (DefUseDstReg == DefUseMI.getOperand(3).getReg()) {
+      std::tie(PredIdx, DOPIdx, SrcIdx, Src2Idx) = std::make_tuple(1, 3, 4, 2);
+      UseRev = true;
+    } else if (DefUseDstReg == DefUseMI.getOperand(4).getReg()) {
+      std::tie(PredIdx, DOPIdx, SrcIdx, Src2Idx) = std::make_tuple(1, 4, 3, 2);
+      UseRev = true;
+    }
+    break;
+  case AArch64::DestructiveOther:
+    switch (Opcode) {
+    case AArch64::FMAD_ZPmZZ_D:
+    case AArch64::FMAD_ZPmZZ_H:
+    case AArch64::FMAD_ZPmZZ_S:
+    case AArch64::FMSB_ZPmZZ_D:
+    case AArch64::FMSB_ZPmZZ_H:
+    case AArch64::FMSB_ZPmZZ_S:
+    case AArch64::MAD_ZPmZZ_B:
+    case AArch64::MAD_ZPmZZ_D:
+    case AArch64::MAD_ZPmZZ_H:
+    case AArch64::MAD_ZPmZZ_S:
+    case AArch64::MLA_ZPmZZ_B:
+    case AArch64::MLA_ZPmZZ_D:
+    case AArch64::MLA_ZPmZZ_H:
+    case AArch64::MLA_ZPmZZ_S:
+    case AArch64::MLS_ZPmZZ_B:
+    case AArch64::MLS_ZPmZZ_D:
+    case AArch64::MLS_ZPmZZ_H:
+    case AArch64::MLS_ZPmZZ_S:
+    case AArch64::MSB_ZPmZZ_B:
+    case AArch64::MSB_ZPmZZ_D:
+    case AArch64::MSB_ZPmZZ_H:
+    case AArch64::MSB_ZPmZZ_S:
+    case AArch64::FNMAD_ZPmZZ_H:
+    case AArch64::FNMAD_ZPmZZ_S:
+    case AArch64::FNMAD_ZPmZZ_D:
+    case AArch64::FNMSB_ZPmZZ_H:
+    case AArch64::FNMSB_ZPmZZ_S:
+    case AArch64::FNMSB_ZPmZZ_D:
+      std::tie(PredIdx, DOPIdx, SrcIdx, Src2Idx) = std::make_tuple(1, 2, 3, 4);
+      break;
+    case AArch64::FCMLA_ZPmZZ_H:
+    case AArch64::FCMLA_ZPmZZ_S:
+    case AArch64::FCMLA_ZPmZZ_D:
+      std::tie(PredIdx, DOPIdx, SrcIdx, Src2Idx, Src3Idx) =
+          std::make_tuple(1, 2, 3, 4, 5);
+      break;
+    case AArch64::SHADD_ZPmZ_B:
+    case AArch64::SHADD_ZPmZ_H:
+    case AArch64::SHADD_ZPmZ_S:
+    case AArch64::SHADD_ZPmZ_D:
+    case AArch64::UHADD_ZPmZ_B:
+    case AArch64::UHADD_ZPmZ_H:
+    case AArch64::UHADD_ZPmZ_S:
+    case AArch64::UHADD_ZPmZ_D:
+    case AArch64::SHSUB_ZPmZ_B:
+    case AArch64::SHSUB_ZPmZ_H:
+    case AArch64::SHSUB_ZPmZ_S:
+    case AArch64::SHSUB_ZPmZ_D:
+    case AArch64::UHSUB_ZPmZ_B:
+    case AArch64::UHSUB_ZPmZ_H:
+    case AArch64::UHSUB_ZPmZ_S:
+    case AArch64::UHSUB_ZPmZ_D:
+    case AArch64::SHSUBR_ZPmZ_B:
+    case AArch64::SHSUBR_ZPmZ_H:
+    case AArch64::SHSUBR_ZPmZ_S:
+    case AArch64::SHSUBR_ZPmZ_D:
+    case AArch64::UHSUBR_ZPmZ_B:
+    case AArch64::UHSUBR_ZPmZ_H:
+    case AArch64::UHSUBR_ZPmZ_S:
+    case AArch64::UHSUBR_ZPmZ_D:
+    case AArch64::SRHADD_ZPmZ_B:
+    case AArch64::SRHADD_ZPmZ_H:
+    case AArch64::SRHADD_ZPmZ_S:
+    case AArch64::SRHADD_ZPmZ_D:
+    case AArch64::URHADD_ZPmZ_B:
+    case AArch64::URHADD_ZPmZ_H:
+    case AArch64::URHADD_ZPmZ_S:
+    case AArch64::URHADD_ZPmZ_D:
+    case AArch64::SQADD_ZPmZ_B:
+    case AArch64::SQADD_ZPmZ_H:
+    case AArch64::SQADD_ZPmZ_S:
+    case AArch64::SQADD_ZPmZ_D:
+    case AArch64::UQADD_ZPmZ_B:
+    case AArch64::UQADD_ZPmZ_H:
+    case AArch64::UQADD_ZPmZ_S:
+    case AArch64::UQADD_ZPmZ_D:
+    case AArch64::SQSUB_ZPmZ_B:
+    case AArch64::SQSUB_ZPmZ_H:
+    case AArch64::SQSUB_ZPmZ_S:
+    case AArch64::SQSUB_ZPmZ_D:
+    case AArch64::UQSUB_ZPmZ_B:
+    case AArch64::UQSUB_ZPmZ_H:
+    case AArch64::UQSUB_ZPmZ_S:
+    case AArch64::UQSUB_ZPmZ_D:
+    case AArch64::SUQADD_ZPmZ_B:
+    case AArch64::SUQADD_ZPmZ_H:
+    case AArch64::SUQADD_ZPmZ_S:
+    case AArch64::SUQADD_ZPmZ_D:
+    case AArch64::USQADD_ZPmZ_B:
+    case AArch64::USQADD_ZPmZ_H:
+    case AArch64::USQADD_ZPmZ_S:
+    case AArch64::USQADD_ZPmZ_D:
+    case AArch64::SQSUBR_ZPmZ_B:
+    case AArch64::SQSUBR_ZPmZ_H:
+    case AArch64::SQSUBR_ZPmZ_S:
+    case AArch64::SQSUBR_ZPmZ_D:
+    case AArch64::UQSUBR_ZPmZ_B:
+    case AArch64::UQSUBR_ZPmZ_H:
+    case AArch64::UQSUBR_ZPmZ_S:
+    case AArch64::UQSUBR_ZPmZ_D:
+    case AArch64::ADDP_ZPmZ_B:
+    case AArch64::ADDP_ZPmZ_H:
+    case AArch64::ADDP_ZPmZ_S:
+    case AArch64::ADDP_ZPmZ_D:
+    case AArch64::SADALP_ZPmZ_H:
+    case AArch64::SADALP_ZPmZ_S:
+    case AArch64::SADALP_ZPmZ_D:
+    case AArch64::UADALP_ZPmZ_H:
+    case AArch64::UADALP_ZPmZ_S:
+    case AArch64::UADALP_ZPmZ_D:
+    case AArch64::SMAXP_ZPmZ_B:
+    case AArch64::SMAXP_ZPmZ_H:
+    case AArch64::SMAXP_ZPmZ_S:
+    case AArch64::SMAXP_ZPmZ_D:
+    case AArch64::UMAXP_ZPmZ_B:
+    case AArch64::UMAXP_ZPmZ_H:
+    case AArch64::UMAXP_ZPmZ_S:
+    case AArch64::UMAXP_ZPmZ_D:
+    case AArch64::SMINP_ZPmZ_B:
+    case AArch64::SMINP_ZPmZ_H:
+    case AArch64::SMINP_ZPmZ_S:
+    case AArch64::SMINP_ZPmZ_D:
+    case AArch64::UMINP_ZPmZ_B:
+    case AArch64::UMINP_ZPmZ_H:
+    case AArch64::UMINP_ZPmZ_S:
+    case AArch64::UMINP_ZPmZ_D:
+    case AArch64::FABD_ZPmZ_H:
+    case AArch64::FABD_ZPmZ_S:
+    case AArch64::FABD_ZPmZ_D:
+    case AArch64::FADDP_ZPmZZ_H:
+    case AArch64::FADDP_ZPmZZ_S:
+    case AArch64::FADDP_ZPmZZ_D:
+    case AArch64::FCADD_ZPmZ_H:
+    case AArch64::FCADD_ZPmZ_S:
+    case AArch64::FCADD_ZPmZ_D:
+    case AArch64::FMAXNMP_ZPmZZ_H:
+    case AArch64::FMAXNMP_ZPmZZ_S:
+    case AArch64::FMAXNMP_ZPmZZ_D:
+    case AArch64::FMINNMP_ZPmZZ_H:
+    case AArch64::FMINNMP_ZPmZZ_S:
+    case AArch64::FMINNMP_ZPmZZ_D:
+    case AArch64::FMAXP_ZPmZZ_H:
+    case AArch64::FMAXP_ZPmZZ_S:
+    case AArch64::FMAXP_ZPmZZ_D:
+    case AArch64::FMINP_ZPmZZ_H:
+    case AArch64::FMINP_ZPmZZ_S:
+    case AArch64::FMINP_ZPmZZ_D:
+    case AArch64::FSCALE_ZPmZ_H:
+    case AArch64::FSCALE_ZPmZ_S:
+    case AArch64::FSCALE_ZPmZ_D:
+    case AArch64::FMULX_ZPmZ_H:
+    case AArch64::FMULX_ZPmZ_S:
+    case AArch64::FMULX_ZPmZ_D:
+      std::tie(PredIdx, DOPIdx, SrcIdx) = std::make_tuple(1, 2, 3);
+      break;
+    case AArch64::SQABS_ZPmZ_B:
+    case AArch64::SQABS_ZPmZ_H:
+    case AArch64::SQABS_ZPmZ_S:
+    case AArch64::SQABS_ZPmZ_D:
+    case AArch64::SQNEG_ZPmZ_B:
+    case AArch64::SQNEG_ZPmZ_H:
+    case AArch64::SQNEG_ZPmZ_S:
+    case AArch64::SQNEG_ZPmZ_D:
+      std::tie(PredIdx, DOPIdx, SrcIdx) = std::make_tuple(2, 1, 3);
+      break;
+    case AArch64::SABALB_ZZZ_D:
+    case AArch64::SABALB_ZZZ_H:
+    case AArch64::SABALB_ZZZ_S:
+    case AArch64::SABALT_ZZZ_D:
+    case AArch64::SABALT_ZZZ_H:
+    case AArch64::SABALT_ZZZ_S:
+    case AArch64::UABALB_ZZZ_D:
+    case AArch64::UABALB_ZZZ_H:
+    case AArch64::UABALB_ZZZ_S:
+    case AArch64::UABALT_ZZZ_D:
+    case AArch64::UABALT_ZZZ_H:
+    case AArch64::UABALT_ZZZ_S:
+    case AArch64::SABA_ZZZ_D:
+    case AArch64::SABA_ZZZ_H:
+    case AArch64::SABA_ZZZ_S:
+    case AArch64::SABA_ZZZ_B:
+    case AArch64::ADCLB_ZZZ_S:
+    case AArch64::ADCLB_ZZZ_D:
+    case AArch64::ADCLT_ZZZ_S:
+    case AArch64::ADCLT_ZZZ_D:
+    case AArch64::SBCLB_ZZZ_S:
+    case AArch64::SBCLB_ZZZ_D:
+    case AArch64::SBCLT_ZZZ_S:
+    case AArch64::SBCLT_ZZZ_D:
+    case AArch64::BSL_ZZZZ:
+    case AArch64::BSL1N_ZZZZ:
+    case AArch64::BSL2N_ZZZZ:
+    case AArch64::NBSL_ZZZZ:
+    case AArch64::SSRA_ZZI_B:
+    case AArch64::SSRA_ZZI_H:
+    case AArch64::SSRA_ZZI_S:
+    case AArch64::SSRA_ZZI_D:
+    case AArch64::USRA_ZZI_B:
+    case AArch64::USRA_ZZI_H:
+    case AArch64::USRA_ZZI_S:
+    case AArch64::USRA_ZZI_D:
+    case AArch64::SRSRA_ZZI_B:
+    case AArch64::SRSRA_ZZI_H:
+    case AArch64::SRSRA_ZZI_S:
+    case AArch64::SRSRA_ZZI_D:
+    case AArch64::URSRA_ZZI_B:
+    case AArch64::URSRA_ZZI_H:
+    case AArch64::URSRA_ZZI_S:
+    case AArch64::URSRA_ZZI_D:
+    case AArch64::EXT_ZZI:
+    case AArch64::CADD_ZZI_B:
+    case AArch64::CADD_ZZI_H:
+    case AArch64::CADD_ZZI_S:
+    case AArch64::CADD_ZZI_D:
+    case AArch64::SQCADD_ZZI_B:
+    case AArch64::SQCADD_ZZI_H:
+    case AArch64::SQCADD_ZZI_S:
+    case AArch64::SQCADD_ZZI_D:
+    case AArch64::CMLA_ZZZ_B:
+    case AArch64::CMLA_ZZZ_H:
+    case AArch64::CMLA_ZZZ_S:
+    case AArch64::CMLA_ZZZ_D:
+    case AArch64::SMLALB_ZZZ_H:
+    case AArch64::SMLALB_ZZZ_S:
+    case AArch64::SMLALB_ZZZ_D:
+    case AArch64::SMLALT_ZZZ_H:
+    case AArch64::SMLALT_ZZZ_S:
+    case AArch64::SMLALT_ZZZ_D:
+    case AArch64::SMLSLB_ZZZ_H:
+    case AArch64::SMLSLB_ZZZ_S:
+    case AArch64::SMLSLB_ZZZ_D:
+    case AArch64::SMLSLT_ZZZ_H:
+    case AArch64::SMLSLT_ZZZ_S:
+    case AArch64::SMLSLT_ZZZ_D:
+    case AArch64::UMLSLB_ZZZ_H:
+    case AArch64::UMLSLB_ZZZ_S:
+    case AArch64::UMLSLB_ZZZ_D:
+    case AArch64::UMLSLT_ZZZ_H:
+    case AArch64::UMLSLT_ZZZ_S:
+    case AArch64::UMLSLT_ZZZ_D:
+    case AArch64::SQDMLALBT_ZZZ_H:
+    case AArch64::SQDMLALBT_ZZZ_S:
+    case AArch64::SQDMLALBT_ZZZ_D:
+    case AArch64::SQDMLSLBT_ZZZ_H:
+    case AArch64::SQDMLSLBT_ZZZ_S:
+    case AArch64::SQDMLSLBT_ZZZ_D:
+    case AArch64::SQRDCMLAH_ZZZ_B:
+    case AArch64::SQRDCMLAH_ZZZ_H:
+    case AArch64::SQRDCMLAH_ZZZ_S:
+    case AArch64::SQRDCMLAH_ZZZ_D:
+    case AArch64::SQDMLALB_ZZZ_H:
+    case AArch64::SQDMLALB_ZZZ_S:
+    case AArch64::SQDMLALB_ZZZ_D:
+    case AArch64::SQDMLALT_ZZZ_H:
+    case AArch64::SQDMLALT_ZZZ_S:
+    case AArch64::SQDMLALT_ZZZ_D:
+    case AArch64::SQDMLSLB_ZZZ_H:
+    case AArch64::SQDMLSLB_ZZZ_S:
+    case AArch64::SQDMLSLB_ZZZ_D:
+    case AArch64::SQDMLSLT_ZZZ_H:
+    case AArch64::SQDMLSLT_ZZZ_S:
+    case AArch64::SQDMLSLT_ZZZ_D:
+    case AArch64::SQRDMLAH_ZZZ_B:
+    case AArch64::SQRDMLAH_ZZZ_H:
+    case AArch64::SQRDMLAH_ZZZ_S:
+    case AArch64::SQRDMLAH_ZZZ_D:
+    case AArch64::SQRDMLSH_ZZZ_B:
+    case AArch64::SQRDMLSH_ZZZ_H:
+    case AArch64::SQRDMLSH_ZZZ_S:
+    case AArch64::SQRDMLSH_ZZZ_D:
+    case AArch64::XAR_ZZZI_B:
+    case AArch64::XAR_ZZZI_H:
+    case AArch64::XAR_ZZZI_S:
+    case AArch64::XAR_ZZZI_D:
+    case AArch64::EOR3_ZZZZ:
+    case AArch64::BCAX_ZZZZ:
+    case AArch64::FTMAD_ZZI_H:
+    case AArch64::FTMAD_ZZI_S:
+    case AArch64::FTMAD_ZZI_D:
+    case AArch64::ADD_ZI_D:
+    case AArch64::ADD_ZI_H:
+    case AArch64::ADD_ZI_S:
+    case AArch64::ADD_ZI_B:
+    case AArch64::SUB_ZI_D:
+    case AArch64::SUB_ZI_H:
+    case AArch64::SUB_ZI_S:
+    case AArch64::SUB_ZI_B:
+    case AArch64::SUBR_ZI_D:
+    case AArch64::SUBR_ZI_H:
+    case AArch64::SUBR_ZI_S:
+    case AArch64::SUBR_ZI_B:
+    case AArch64::SQADD_ZI_B:
+    case AArch64::SQADD_ZI_H:
+    case AArch64::SQADD_ZI_S:
+    case AArch64::SQADD_ZI_D:
+    case AArch64::UQADD_ZI_B:
+    case AArch64::UQADD_ZI_H:
+    case AArch64::UQADD_ZI_S:
+    case AArch64::UQADD_ZI_D:
+    case AArch64::SQSUB_ZI_B:
+    case AArch64::SQSUB_ZI_H:
+    case AArch64::SQSUB_ZI_S:
+    case AArch64::SQSUB_ZI_D:
+    case AArch64::UQSUB_ZI_B:
+    case AArch64::UQSUB_ZI_H:
+    case AArch64::UQSUB_ZI_S:
+    case AArch64::UQSUB_ZI_D:
+      std::tie(DOPIdx, SrcIdx, Src2Idx) = std::make_tuple(1, 2, 3);
+      break;
+    case AArch64::SMAX_ZI_B:
+    case AArch64::SMAX_ZI_H:
+    case AArch64::SMAX_ZI_S:
+    case AArch64::SMAX_ZI_D:
+    case AArch64::UMAX_ZI_B:
+    case AArch64::UMAX_ZI_H:
+    case AArch64::UMAX_ZI_S:
+    case AArch64::UMAX_ZI_D:
+    case AArch64::SMIN_ZI_B:
+    case AArch64::SMIN_ZI_H:
+    case AArch64::SMIN_ZI_S:
+    case AArch64::SMIN_ZI_D:
+    case AArch64::UMIN_ZI_B:
+    case AArch64::UMIN_ZI_H:
+    case AArch64::UMIN_ZI_S:
+    case AArch64::UMIN_ZI_D:
+    case AArch64::MUL_ZI_B:
+    case AArch64::MUL_ZI_H:
+    case AArch64::MUL_ZI_S:
+    case AArch64::MUL_ZI_D:
+    case AArch64::AND_ZI:
+    case AArch64::EOR_ZI:
+    case AArch64::ORR_ZI:
+      std::tie(DOPIdx, SrcIdx) = std::make_tuple(1, 2);
+      break;
+    default:
+      return false;
+    }
+    break;
+  default:
+    llvm_unreachable("Unsupported Destructive Operand type.");
+  }
+  // Resolve the reverse opcode (e.g. DIV -> DIVR) when the destructive
+  // operand ended up being operand 3 (SrcIdx) of a commutative-with-rev
+  // destructive instruction; this lets the resulting instruction use the
+  // mov's destination as the destructive operand.
+  if (UseRev) {
+    int NewOpcode = AArch64::getSVERevInstr(Opcode);
+    if (NewOpcode != -1)
+      Opcode = NewOpcode;
+  }
+
+  // Insert the movprfx + new destructive instruction either:
+  //  - immediately before the original destructive instruction (when the
+  //    mov's source register is still live and unchanged at that point), or
+  //  - at the original mov position (when the source register may have been
+  //    redefined between the mov and the destructive instruction).
+  MachineInstrBuilder PRFX, DOP;
+  MachineBasicBlock::iterator InsertPos = IsMoveOrr ? DefUseMBBI : MovMBBI;
+  PRFX =
+      BuildMI(MBB, InsertPos, MI.getDebugLoc(), TII->get(AArch64::MOVPRFX_ZZ))
+          .addReg(CopyDstReg, RegState::Define)
+          .addReg(CopySrcReg);
+  // After movprfx, the destructive operand of the new instruction is the
+  // destination register itself (operand 0).
+  DOPIdx = 0;
+
+  DOP = BuildMI(MBB, InsertPos, DefUseMI.getDebugLoc(), TII->get(Opcode))
+            .addReg(
+                DefUseDstReg,
+                RegState::Define | getDeadRegState(DstIsDead) |
+                    getRenamableRegState(DefUseMI.getOperand(0).isRenamable()));
+  DOP.setMIFlags(DefUseMI.getFlags());
+
+  switch (DType) {
+  case AArch64::DestructiveUnaryPassthru:
+    DOP.addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+        .add(DefUseMI.getOperand(PredIdx))
+        .add(DefUseMI.getOperand(SrcIdx));
+    break;
+  case AArch64::DestructiveBinary:
+  case AArch64::DestructiveBinaryImm:
+  case AArch64::DestructiveBinaryComm:
+  case AArch64::DestructiveBinaryCommWithRev:
+    DOP.add(DefUseMI.getOperand(PredIdx))
+        .addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+        .add(DefUseMI.getOperand(SrcIdx));
+    break;
+  case AArch64::DestructiveTernaryCommWithRev:
+    DOP.add(DefUseMI.getOperand(PredIdx))
+        .addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+        .add(DefUseMI.getOperand(SrcIdx))
+        .add(DefUseMI.getOperand(Src2Idx));
+    break;
+  case AArch64::DestructiveOther:
+    switch (Opcode) {
+    default:
+      return false;
+    case AArch64::FMAD_ZPmZZ_D:
+    case AArch64::FMAD_ZPmZZ_H:
+    case AArch64::FMAD_ZPmZZ_S:
+    case AArch64::FMSB_ZPmZZ_D:
+    case AArch64::FMSB_ZPmZZ_H:
+    case AArch64::FMSB_ZPmZZ_S:
+    case AArch64::MAD_ZPmZZ_B:
+    case AArch64::MAD_ZPmZZ_D:
+    case AArch64::MAD_ZPmZZ_H:
+    case AArch64::MAD_ZPmZZ_S:
+    case AArch64::MLA_ZPmZZ_B:
+    case AArch64::MLA_ZPmZZ_D:
+    case AArch64::MLA_ZPmZZ_H:
+    case AArch64::MLA_ZPmZZ_S:
+    case AArch64::MLS_ZPmZZ_B:
+    case AArch64::MLS_ZPmZZ_D:
+    case AArch64::MLS_ZPmZZ_H:
+    case AArch64::MLS_ZPmZZ_S:
+    case AArch64::MSB_ZPmZZ_B:
+    case AArch64::MSB_ZPmZZ_D:
+    case AArch64::MSB_ZPmZZ_H:
+    case AArch64::MSB_ZPmZZ_S:
+    case AArch64::FNMAD_ZPmZZ_H:
+    case AArch64::FNMAD_ZPmZZ_S:
+    case AArch64::FNMAD_ZPmZZ_D:
+    case AArch64::FNMSB_ZPmZZ_H:
+    case AArch64::FNMSB_ZPmZZ_S:
+    case AArch64::FNMSB_ZPmZZ_D:
+      DOP.add(DefUseMI.getOperand(PredIdx))
+          .addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+          .add(DefUseMI.getOperand(SrcIdx))
+          .add(DefUseMI.getOperand(Src2Idx));
+      break;
+    case AArch64::FCMLA_ZPmZZ_H:
+    case AArch64::FCMLA_ZPmZZ_S:
+    case AArch64::FCMLA_ZPmZZ_D:
+      DOP.add(DefUseMI.getOperand(PredIdx))
+          .addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+          .add(DefUseMI.getOperand(SrcIdx))
+          .add(DefUseMI.getOperand(Src2Idx))
+          .add(DefUseMI.getOperand(Src3Idx));
+      break;
+    case AArch64::SHADD_ZPmZ_B:
+    case AArch64::SHADD_ZPmZ_H:
+    case AArch64::SHADD_ZPmZ_S:
+    case AArch64::SHADD_ZPmZ_D:
+    case AArch64::UHADD_ZPmZ_B:
+    case AArch64::UHADD_ZPmZ_H:
+    case AArch64::UHADD_ZPmZ_S:
+    case AArch64::UHADD_ZPmZ_D:
+    case AArch64::SHSUB_ZPmZ_B:
+    case AArch64::SHSUB_ZPmZ_H:
+    case AArch64::SHSUB_ZPmZ_S:
+    case AArch64::SHSUB_ZPmZ_D:
+    case AArch64::UHSUB_ZPmZ_B:
+    case AArch64::UHSUB_ZPmZ_H:
+    case AArch64::UHSUB_ZPmZ_S:
+    case AArch64::UHSUB_ZPmZ_D:
+    case AArch64::SHSUBR_ZPmZ_B:
+    case AArch64::SHSUBR_ZPmZ_H:
+    case AArch64::SHSUBR_ZPmZ_S:
+    case AArch64::SHSUBR_ZPmZ_D:
+    case AArch64::UHSUBR_ZPmZ_B:
+    case AArch64::UHSUBR_ZPmZ_H:
+    case AArch64::UHSUBR_ZPmZ_S:
+    case AArch64::UHSUBR_ZPmZ_D:
+    case AArch64::SRHADD_ZPmZ_B:
+    case AArch64::SRHADD_ZPmZ_H:
+    case AArch64::SRHADD_ZPmZ_S:
+    case AArch64::SRHADD_ZPmZ_D:
+    case AArch64::URHADD_ZPmZ_B:
+    case AArch64::URHADD_ZPmZ_H:
+    case AArch64::URHADD_ZPmZ_S:
+    case AArch64::URHADD_ZPmZ_D:
+    case AArch64::SQADD_ZPmZ_B:
+    case AArch64::SQADD_ZPmZ_H:
+    case AArch64::SQADD_ZPmZ_S:
+    case AArch64::SQADD_ZPmZ_D:
+    case AArch64::UQADD_ZPmZ_B:
+    case AArch64::UQADD_ZPmZ_H:
+    case AArch64::UQADD_ZPmZ_S:
+    case AArch64::UQADD_ZPmZ_D:
+    case AArch64::SQSUB_ZPmZ_B:
+    case AArch64::SQSUB_ZPmZ_H:
+    case AArch64::SQSUB_ZPmZ_S:
+    case AArch64::SQSUB_ZPmZ_D:
+    case AArch64::UQSUB_ZPmZ_B:
+    case AArch64::UQSUB_ZPmZ_H:
+    case AArch64::UQSUB_ZPmZ_S:
+    case AArch64::UQSUB_ZPmZ_D:
+    case AArch64::SUQADD_ZPmZ_B:
+    case AArch64::SUQADD_ZPmZ_H:
+    case AArch64::SUQADD_ZPmZ_S:
+    case AArch64::SUQADD_ZPmZ_D:
+    case AArch64::USQADD_ZPmZ_B:
+    case AArch64::USQADD_ZPmZ_H:
+    case AArch64::USQADD_ZPmZ_S:
+    case AArch64::USQADD_ZPmZ_D:
+    case AArch64::SQSUBR_ZPmZ_B:
+    case AArch64::SQSUBR_ZPmZ_H:
+    case AArch64::SQSUBR_ZPmZ_S:
+    case AArch64::SQSUBR_ZPmZ_D:
+    case AArch64::UQSUBR_ZPmZ_B:
+    case AArch64::UQSUBR_ZPmZ_H:
+    case AArch64::UQSUBR_ZPmZ_S:
+    case AArch64::UQSUBR_ZPmZ_D:
+    case AArch64::ADDP_ZPmZ_B:
+    case AArch64::ADDP_ZPmZ_H:
+    case AArch64::ADDP_ZPmZ_S:
+    case AArch64::ADDP_ZPmZ_D:
+    case AArch64::SADALP_ZPmZ_H:
+    case AArch64::SADALP_ZPmZ_S:
+    case AArch64::SADALP_ZPmZ_D:
+    case AArch64::UADALP_ZPmZ_H:
+    case AArch64::UADALP_ZPmZ_S:
+    case AArch64::UADALP_ZPmZ_D:
+    case AArch64::SMAXP_ZPmZ_B:
+    case AArch64::SMAXP_ZPmZ_H:
+    case AArch64::SMAXP_ZPmZ_S:
+    case AArch64::SMAXP_ZPmZ_D:
+    case AArch64::UMAXP_ZPmZ_B:
+    case AArch64::UMAXP_ZPmZ_H:
+    case AArch64::UMAXP_ZPmZ_S:
+    case AArch64::UMAXP_ZPmZ_D:
+    case AArch64::SMINP_ZPmZ_B:
+    case AArch64::SMINP_ZPmZ_H:
+    case AArch64::SMINP_ZPmZ_S:
+    case AArch64::SMINP_ZPmZ_D:
+    case AArch64::UMINP_ZPmZ_B:
+    case AArch64::UMINP_ZPmZ_H:
+    case AArch64::UMINP_ZPmZ_S:
+    case AArch64::UMINP_ZPmZ_D:
+    case AArch64::FABD_ZPmZ_H:
+    case AArch64::FABD_ZPmZ_S:
+    case AArch64::FABD_ZPmZ_D:
+    case AArch64::FADDP_ZPmZZ_H:
+    case AArch64::FADDP_ZPmZZ_S:
+    case AArch64::FADDP_ZPmZZ_D:
+    case AArch64::FCADD_ZPmZ_H:
+    case AArch64::FCADD_ZPmZ_S:
+    case AArch64::FCADD_ZPmZ_D:
+    case AArch64::FMAXNMP_ZPmZZ_H:
+    case AArch64::FMAXNMP_ZPmZZ_S:
+    case AArch64::FMAXNMP_ZPmZZ_D:
+    case AArch64::FMINNMP_ZPmZZ_H:
+    case AArch64::FMINNMP_ZPmZZ_S:
+    case AArch64::FMINNMP_ZPmZZ_D:
+    case AArch64::FMAXP_ZPmZZ_H:
+    case AArch64::FMAXP_ZPmZZ_S:
+    case AArch64::FMAXP_ZPmZZ_D:
+    case AArch64::FMINP_ZPmZZ_H:
+    case AArch64::FMINP_ZPmZZ_S:
+    case AArch64::FMINP_ZPmZZ_D:
+    case AArch64::FSCALE_ZPmZ_H:
+    case AArch64::FSCALE_ZPmZ_S:
+    case AArch64::FSCALE_ZPmZ_D:
+    case AArch64::FMULX_ZPmZ_H:
+    case AArch64::FMULX_ZPmZ_S:
+    case AArch64::FMULX_ZPmZ_D:
+      DOP.add(DefUseMI.getOperand(PredIdx))
+          .addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+          .add(DefUseMI.getOperand(SrcIdx));
+      break;
+    case AArch64::SQABS_ZPmZ_B:
+    case AArch64::SQABS_ZPmZ_H:
+    case AArch64::SQABS_ZPmZ_S:
+    case AArch64::SQABS_ZPmZ_D:
+    case AArch64::SQNEG_ZPmZ_B:
+    case AArch64::SQNEG_ZPmZ_H:
+    case AArch64::SQNEG_ZPmZ_S:
+    case AArch64::SQNEG_ZPmZ_D:
+      DOP.addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+          .add(DefUseMI.getOperand(PredIdx))
+          .add(DefUseMI.getOperand(SrcIdx));
+      break;
+    case AArch64::SABALB_ZZZ_D:
+    case AArch64::SABALB_ZZZ_H:
+    case AArch64::SABALB_ZZZ_S:
+    case AArch64::SABALT_ZZZ_D:
+    case AArch64::SABALT_ZZZ_H:
+    case AArch64::SABALT_ZZZ_S:
+    case AArch64::UABALB_ZZZ_D:
+    case AArch64::UABALB_ZZZ_H:
+    case AArch64::UABALB_ZZZ_S:
+    case AArch64::UABALT_ZZZ_D:
+    case AArch64::UABALT_ZZZ_H:
+    case AArch64::UABALT_ZZZ_S:
+    case AArch64::SABA_ZZZ_D:
+    case AArch64::SABA_ZZZ_H:
+    case AArch64::SABA_ZZZ_S:
+    case AArch64::SABA_ZZZ_B:
+    case AArch64::ADCLB_ZZZ_S:
+    case AArch64::ADCLB_ZZZ_D:
+    case AArch64::ADCLT_ZZZ_S:
+    case AArch64::ADCLT_ZZZ_D:
+    case AArch64::SBCLB_ZZZ_S:
+    case AArch64::SBCLB_ZZZ_D:
+    case AArch64::SBCLT_ZZZ_S:
+    case AArch64::SBCLT_ZZZ_D:
+    case AArch64::BSL_ZZZZ:
+    case AArch64::BSL1N_ZZZZ:
+    case AArch64::BSL2N_ZZZZ:
+    case AArch64::NBSL_ZZZZ:
+    case AArch64::SSRA_ZZI_B:
+    case AArch64::SSRA_ZZI_H:
+    case AArch64::SSRA_ZZI_S:
+    case AArch64::SSRA_ZZI_D:
+    case AArch64::USRA_ZZI_B:
+    case AArch64::USRA_ZZI_H:
+    case AArch64::USRA_ZZI_S:
+    case AArch64::USRA_ZZI_D:
+    case AArch64::SRSRA_ZZI_B:
+    case AArch64::SRSRA_ZZI_H:
+    case AArch64::SRSRA_ZZI_S:
+    case AArch64::SRSRA_ZZI_D:
+    case AArch64::URSRA_ZZI_B:
+    case AArch64::URSRA_ZZI_H:
+    case AArch64::URSRA_ZZI_S:
+    case AArch64::URSRA_ZZI_D:
+    case AArch64::EXT_ZZI:
+    case AArch64::CADD_ZZI_B:
+    case AArch64::CADD_ZZI_H:
+    case AArch64::CADD_ZZI_S:
+    case AArch64::CADD_ZZI_D:
+    case AArch64::SQCADD_ZZI_B:
+    case AArch64::SQCADD_ZZI_H:
+    case AArch64::SQCADD_ZZI_S:
+    case AArch64::SQCADD_ZZI_D:
+    case AArch64::CMLA_ZZZ_B:
+    case AArch64::CMLA_ZZZ_H:
+    case AArch64::CMLA_ZZZ_S:
+    case AArch64::CMLA_ZZZ_D:
+    case AArch64::SMLALB_ZZZ_H:
+    case AArch64::SMLALB_ZZZ_S:
+    case AArch64::SMLALB_ZZZ_D:
+    case AArch64::SMLALT_ZZZ_H:
+    case AArch64::SMLALT_ZZZ_S:
+    case AArch64::SMLALT_ZZZ_D:
+    case AArch64::SMLSLB_ZZZ_H:
+    case AArch64::SMLSLB_ZZZ_S:
+    case AArch64::SMLSLB_ZZZ_D:
+    case AArch64::SMLSLT_ZZZ_H:
+    case AArch64::SMLSLT_ZZZ_S:
+    case AArch64::SMLSLT_ZZZ_D:
+    case AArch64::UMLSLB_ZZZ_H:
+    case AArch64::UMLSLB_ZZZ_S:
+    case AArch64::UMLSLB_ZZZ_D:
+    case AArch64::UMLSLT_ZZZ_H:
+    case AArch64::UMLSLT_ZZZ_S:
+    case AArch64::UMLSLT_ZZZ_D:
+    case AArch64::SQDMLALBT_ZZZ_H:
+    case AArch64::SQDMLALBT_ZZZ_S:
+    case AArch64::SQDMLALBT_ZZZ_D:
+    case AArch64::SQDMLSLBT_ZZZ_H:
+    case AArch64::SQDMLSLBT_ZZZ_S:
+    case AArch64::SQDMLSLBT_ZZZ_D:
+    case AArch64::SQRDCMLAH_ZZZ_B:
+    case AArch64::SQRDCMLAH_ZZZ_H:
+    case AArch64::SQRDCMLAH_ZZZ_S:
+    case AArch64::SQRDCMLAH_ZZZ_D:
+    case AArch64::SQDMLALB_ZZZ_H:
+    case AArch64::SQDMLALB_ZZZ_S:
+    case AArch64::SQDMLALB_ZZZ_D:
+    case AArch64::SQDMLALT_ZZZ_H:
+    case AArch64::SQDMLALT_ZZZ_S:
+    case AArch64::SQDMLALT_ZZZ_D:
+    case AArch64::SQDMLSLB_ZZZ_H:
+    case AArch64::SQDMLSLB_ZZZ_S:
+    case AArch64::SQDMLSLB_ZZZ_D:
+    case AArch64::SQDMLSLT_ZZZ_H:
+    case AArch64::SQDMLSLT_ZZZ_S:
+    case AArch64::SQDMLSLT_ZZZ_D:
+    case AArch64::SQRDMLAH_ZZZ_B:
+    case AArch64::SQRDMLAH_ZZZ_H:
+    case AArch64::SQRDMLAH_ZZZ_S:
+    case AArch64::SQRDMLAH_ZZZ_D:
+    case AArch64::SQRDMLSH_ZZZ_B:
+    case AArch64::SQRDMLSH_ZZZ_H:
+    case AArch64::SQRDMLSH_ZZZ_S:
+    case AArch64::SQRDMLSH_ZZZ_D:
+    case AArch64::XAR_ZZZI_B:
+    case AArch64::XAR_ZZZI_H:
+    case AArch64::XAR_ZZZI_S:
+    case AArch64::XAR_ZZZI_D:
+    case AArch64::EOR3_ZZZZ:
+    case AArch64::BCAX_ZZZZ:
+    case AArch64::FTMAD_ZZI_H:
+    case AArch64::FTMAD_ZZI_S:
+    case AArch64::FTMAD_ZZI_D:
+    case AArch64::ADD_ZI_B:
+    case AArch64::ADD_ZI_D:
+    case AArch64::ADD_ZI_H:
+    case AArch64::ADD_ZI_S:
+    case AArch64::SUB_ZI_B:
+    case AArch64::SUB_ZI_D:
+    case AArch64::SUB_ZI_H:
+    case AArch64::SUB_ZI_S:
+    case AArch64::SUBR_ZI_B:
+    case AArch64::SUBR_ZI_H:
+    case AArch64::SUBR_ZI_S:
+    case AArch64::SUBR_ZI_D:
+    case AArch64::SQADD_ZI_B:
+    case AArch64::SQADD_ZI_H:
+    case AArch64::SQADD_ZI_S:
+    case AArch64::SQADD_ZI_D:
+    case AArch64::UQADD_ZI_B:
+    case AArch64::UQADD_ZI_H:
+    case AArch64::UQADD_ZI_S:
+    case AArch64::UQADD_ZI_D:
+    case AArch64::SQSUB_ZI_B:
+    case AArch64::SQSUB_ZI_H:
+    case AArch64::SQSUB_ZI_S:
+    case AArch64::SQSUB_ZI_D:
+    case AArch64::UQSUB_ZI_B:
+    case AArch64::UQSUB_ZI_H:
+    case AArch64::UQSUB_ZI_S:
+    case AArch64::UQSUB_ZI_D:
+      DOP.addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+          .add(DefUseMI.getOperand(SrcIdx))
+          .add(DefUseMI.getOperand(Src2Idx));
+      break;
+    case AArch64::SMAX_ZI_B:
+    case AArch64::SMAX_ZI_H:
+    case AArch64::SMAX_ZI_S:
+    case AArch64::SMAX_ZI_D:
+    case AArch64::UMAX_ZI_B:
+    case AArch64::UMAX_ZI_H:
+    case AArch64::UMAX_ZI_S:
+    case AArch64::UMAX_ZI_D:
+    case AArch64::SMIN_ZI_B:
+    case AArch64::SMIN_ZI_H:
+    case AArch64::SMIN_ZI_S:
+    case AArch64::SMIN_ZI_D:
+    case AArch64::UMIN_ZI_B:
+    case AArch64::UMIN_ZI_H:
+    case AArch64::UMIN_ZI_S:
+    case AArch64::UMIN_ZI_D:
+    case AArch64::MUL_ZI_B:
+    case AArch64::MUL_ZI_S:
+    case AArch64::MUL_ZI_D:
+    case AArch64::MUL_ZI_H:
+    case AArch64::AND_ZI:
+    case AArch64::EOR_ZI:
+    case AArch64::ORR_ZI:
+      DOP.addReg(DefUseMI.getOperand(DOPIdx).getReg(), RegState::Kill)
+          .add(DefUseMI.getOperand(SrcIdx));
+      break;
+    }
+    break;
+  }
+
+  // Bundle the movprfx and the newly created destructive instruction together
+  // so the scheduler treats them as one unit, and transfer the implicit
+  // operands of whichever original instruction is being removed:
+  //  - When IsMoveOrr is true, the movprfx is placed at the destructive
+  //    instruction's position, so the original mov (MI) is the instruction
+  //    being replaced and its implicit operands are transferred.
+  //  - When IsMoveOrr is false, the movprfx is placed at the original mov
+  //    position, so the destructive instruction (DefUseMI) farther down is
+  //    being replaced and its implicit operands are transferred.
+  // DefUseMI is always removed (deferred via RemoveMIs) because it has been
+  // replaced by the new DOP; the original mov MI is erased immediately.
+  if (IsMoveOrr) {
+    finalizeBundle(MBB, PRFX->getIterator(), DefUseMBBI->getIterator());
+    transferImpOps(MI, PRFX, DOP);
+  } else {
+    finalizeBundle(MBB, PRFX->getIterator(), MovMBBI->getIterator());
+    transferImpOps(DefUseMI, PRFX, DOP);
+  }
+  RemoveMIs.insert(&DefUseMI);
+  MI.eraseFromParent();
+  return true;
+}
+
+bool AArch64ExpandPseudoImpl::isInSpecificInstOpcList(
+    const ArrayRef<unsigned> &SpecificInstOpcList, unsigned UseOpcode) {
+  assert(llvm::is_sorted(SpecificInstOpcList) &&
+         "SpecificInstOpcList must be sorted for binary search");
+  const unsigned *Opc = llvm::lower_bound(SpecificInstOpcList, UseOpcode);
+  return Opc != SpecificInstOpcList.end() && *Opc == UseOpcode;
+}
+
+/// Driver for the mov-to-movprfx transformation. After delegating to the
+/// regular pseudo-expansion `expandMI` overload, this overload looks for a
+/// `mov zD, zS` (encoded as ORR_ZZZ with both source operands equal) followed
+/// within `TraversalInstThreshold` instructions by a destructive instruction
+/// that uses zD, and rewrites the pair into `movprfx zD, zS; <destructive>`.
+///
+/// The transformation is currently gated on the target CPU being "hip12",
+/// where the movprfx + destructive form is performance-beneficial. The
+/// `RemoveMIs` set collects destructive instructions that have been replaced
+/// by the rewrite so that they can be erased after the MBB traversal has
+/// completed (erasing them in-place would invalidate the traversal iterator).
+bool AArch64ExpandPseudoImpl::expandMI(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+    MachineBasicBlock::iterator &NextMBBI,
+    SmallPtrSet<MachineInstr *, 16> &RemoveMIs) {
+  if (expandMI(MBB, MBBI, NextMBBI))
+    return true;
+
+  MachineInstr &MI = *MBBI;
+  const TargetRegisterInfo *TRI =
+      MBB.getParent()->getSubtarget().getRegisterInfo();
+  unsigned Opcode = MI.getOpcode();
+  // Only consider plain register moves encoded as `ORR_ZZZ zD, zS, zS`.
+  if (TransformMovToMovprfx &&
+      MBB.getParent()->getSubtarget().getCPU() == "hip12" &&
+      Opcode == AArch64::ORR_ZZZ && !MI.getOperand(0).isDead() &&
+      MI.getOperand(1).getReg() == MI.getOperand(2).getReg()) {
+    MCPhysReg CopyDstReg = MI.getOperand(0).getReg();
+    MCPhysReg CopySrcReg = MI.getOperand(1).getReg();
+
+    MachineBasicBlock::iterator NMBBI = std::next(MBBI), E = MBB.end();
+    unsigned TraversalCount = 0;
+    // MovOrrInst starts true and is set to false if any instruction between
+    // the mov and the candidate destructive instruction redefines CopySrcReg.
+    // When it remains true the movprfx can be emitted directly at the
+    // destructive instruction's position; otherwise it must stay where the
+    // original mov was.
+    bool MovOrrInst = true;
+    while (NMBBI != E) {
+      if (TraversalCount > TraversalInstThreshold)
+        return false;
+      if (RemoveMIs.count(&*NMBBI)) {
+        ++NMBBI;
+        continue;
+      }
+
+      ++TraversalCount;
+      MachineInstr &NMI = *NMBBI;
+
+      // Scan the candidate instruction's operands:
+      //  - If any operand defines CopySrcReg, the mov's source value has been
+      //    clobbered before this point, so MovOrrInst becomes false.
+      //  - Track whether the candidate references CopyDstReg at all and how
+      //    many times; the destructive instruction must use CopyDstReg
+      //    exactly twice (once as the tied def, once as the destructive src).
+      bool FindSameCopyDstReg = false;
+      unsigned SameCopyDstRegNum = 0;
+      for (unsigned i = 0; i < NMI.getNumOperands(); ++i) {
+        if (!NMI.getOperand(i).isReg())
+          continue;
+        if (NMI.getOperand(i).isDef() &&
+            TRI->regsOverlap(NMI.getOperand(i).getReg(), CopySrcReg))
+          MovOrrInst = false;
+        if (NMI.getOperand(i).getReg() == CopyDstReg) {
+          ++SameCopyDstRegNum;
+          FindSameCopyDstReg = true;
+        }
+      }
+
+      // Not a use of the mov's destination; keep scanning forward.
+      if (!FindSameCopyDstReg) {
+        ++NMBBI;
+        continue;
+      }
+
+      // If the mov's source has been redefined, additionally verify that none
+      // of the candidate instruction's operand registers is redefined by an
+      // instruction between the mov and the candidate. If any are, the
+      // transformation would change semantics and we bail out.
+      if (!MovOrrInst) {
+        for (unsigned i = 0; i < NMI.getNumOperands(); ++i) {
+          if (!NMI.getOperand(i).isReg())
+            continue;
+          MCPhysReg OperandReg = NMI.getOperand(i).getReg();
+          for (MachineBasicBlock::iterator I = std::next(MBBI); I != NMBBI;
+               ++I) {
+            for (unsigned j = 0; j < I->getNumOperands(); ++j) {
+              if (!I->getOperand(j).isReg())
+                continue;
+              if (I->getOperand(j).isDef() &&
+                  TRI->regsOverlap(I->getOperand(j).getReg(), OperandReg))
+                return false;
+            }
+          }
+        }
+      }
+
+      unsigned UseOpcode = NMI.getOpcode();
+      uint64_t DType =
+          TII->get(UseOpcode).TSFlags & AArch64::DestructiveInstTypeMask;
+      if (DType == AArch64::NotDestructive)
+        return false;
+      if (DType == AArch64::DestructiveBinary)
+        // For a plain DestructiveBinary the destructive operand is operand 3
+        // (the second source). If CopyDstReg already lives there the mov is
+        // pointless, so this should never happen for a real candidate.
+        assert(CopyDstReg != NMI.getOperand(3).getReg() &&
+               "DestructiveBinary candidate should not have CopyDstReg as "
+               "its second source operand");
+
+      if (DType == AArch64::DestructiveOther) {
+        // For DestructiveOther instructions, refuse to transform if
+        // CopyDstReg appears in operand 3 or 4 (the additional source
+        // operands); doing so would require a more involved rewrite.
+        if (NMI.getNumOperands() > 4 &&
+            ((NMI.getOperand(3).isReg() &&
+              CopyDstReg == NMI.getOperand(3).getReg()) ||
+             (NMI.getOperand(4).isReg() &&
+              CopyDstReg == NMI.getOperand(4).getReg())))
+          return false;
+      }
+
+      // The candidate must reference CopyDstReg exactly twice (def + use),
+      // operand 0 must be a tied register definition, and it must be tied to
+      // an operand with index >= 1 (i.e. the destructive operand).
+      if (SameCopyDstRegNum != 2 || !NMI.getOperand(0).isReg() ||
+          !NMI.getOperand(0).isTied() || NMI.findTiedOperandIdx(0) < 1 ||
+          NMI.getOperand(0).getReg() != CopyDstReg)
+        return false;
+      return optimizeMI(MI, NMI, MBB, MBBI, NMBBI, RemoveMIs, MovOrrInst);
+    }
+    return false;
+  }
+  return false;
+}
+
 /// Iterate over the instructions in basic block MBB and expand any
 /// pseudo instructions.  Return true if anything was modified.
 bool AArch64ExpandPseudoImpl::expandMBB(MachineBasicBlock &MBB) {
   bool Modified = false;
 
+  // RemoveMIs collects destructive instructions that have been replaced by
+  // the mov-to-movprfx rewrite; they are erased after the traversal so that
+  // iterator invalidation does not disturb the in-progress MBB scan.
+  SmallPtrSet<MachineInstr *, 16> RemoveMIs;
   MachineBasicBlock::iterator MBBI = MBB.begin(), E = MBB.end();
   while (MBBI != E) {
     MachineBasicBlock::iterator NMBBI = std::next(MBBI);
-    if (MBBI->isPseudo())
-      Modified |= expandMI(MBB, MBBI, NMBBI);
+    // In addition to real pseudo instructions, also feed `ORR_ZZZ` movs to
+    // the new expandMI overload so it can attempt the mov -> movprfx rewrite.
+    // Skip instructions that are already queued for removal.
+    if ((MBBI->isPseudo() || MBBI->getOpcode() == AArch64::ORR_ZZZ) &&
+        !RemoveMIs.count(&*MBBI))
+      Modified |= expandMI(MBB, MBBI, NMBBI, RemoveMIs);
     MBBI = NMBBI;
   }
+
+  for (MachineInstr *MI : RemoveMIs)
+    MI->eraseFromParent();
 
   return Modified;
 }
